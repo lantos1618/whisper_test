@@ -1,0 +1,20 @@
+
+
+[package]
+name = "whisper_test"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lyndon <lyndon@lyndon.dev>"]
+
+[dependencies]
+cargo-bundle = "0.6.1"
+cpal = "0.15.3"
+
+[package.metadata.bundle]
+name = "Whisper Test"
+identifier = "com.example.whispertest"
+version = "0.1.0"
+resources = ["Info.plist"]
+
+[package.metadata.bundle.macos]
+info_plist = "Info.plist"

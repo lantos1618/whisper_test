@@ -3,6 +3,11 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 use textplots::{Chart, Plot, Shape};
 use std::sync::{Arc, Mutex};
+use termion::{clear, cursor};
+use termion::terminal_size;
+use std::thread;
+use std::sync::mpsc;
+use std::convert::TryInto;
 
 fn main() {
     let host = cpal::default_host();
@@ -14,13 +19,19 @@ fn main() {
     // Shared state for the maximum decibel value
     let max_db_value = Arc::new(Mutex::new(f32::NEG_INFINITY));
 
+    // Channel for sending data to the plotting thread
+    let (tx, rx) = mpsc::channel();
+
     let stream = device.build_input_stream(
         &config.clone().into(),
         {
             let max_db_value = Arc::clone(&max_db_value);
+            let tx = tx.clone();
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Convert the input data to complex numbers
+                // Increase the FFT size by zero-padding the input data
+                let fft_size = 4096;
                 let mut buffer: Vec<Complex<f32>> = data.iter().map(|&x| Complex::new(x, 0.0)).collect();
+                buffer.resize(fft_size, Complex::new(0.0, 0.0)); // Zero-padding
 
                 // Create an FFT planner and perform the FFT
                 let mut planner = FftPlanner::new();
@@ -32,38 +43,18 @@ fn main() {
                 let sample_rate = config.sample_rate().0 as f32;
                 let frequencies: Vec<f32> = (0..buffer.len()).map(|i| i as f32 * sample_rate / buffer.len() as f32).collect();
 
-                // Convert magnitudes to decibels and normalize
-                let magnitudes_db: Vec<f32> = magnitudes.iter().map(|&m| 20.0 * m.log10()).collect();
-                let max_db = magnitudes_db.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let min_db = magnitudes_db.iter().cloned().fold(f32::INFINITY, f32::min);
-                let normalized_db: Vec<f32> = magnitudes_db.iter().map(|&m| (m - min_db) / (max_db - min_db) * 100.0).collect();
-
-                // Apply a noise gate: set a threshold below which magnitudes are considered noise
-                let noise_threshold = 20.0; // Adjust this threshold as needed
-                let gated_db: Vec<f32> = normalized_db.iter().map(|&m| if m < noise_threshold { 0.0 } else { m }).collect();
-
-                // Update the maximum decibel value
+                // Update maximum decibel value to track highest signal
                 {
                     let mut max_db_lock = max_db_value.lock().unwrap();
+                    let max_magnitude = magnitudes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let max_db = 20.0 * max_magnitude.log10();
                     if max_db > *max_db_lock {
                         *max_db_lock = max_db;
                     }
                 }
 
-                // Plot the frequency spectrum for the human voice range
-                println!("Frequency Spectrum (Human Voice Range):");
-                Chart::new(180, 40, 85.0, 3400.0) // Adjusted range for human voice
-                    .lineplot(&Shape::Continuous(Box::new(move |x| {
-                        // Interpolate the gated magnitude for the given frequency x
-                        let mut closest = (0.0, 0.0);
-                        for (&f, &m_gated) in frequencies.iter().zip(gated_db.iter()) {
-                            if (f - x).abs() < (closest.0 - x).abs() {
-                                closest = (f, m_gated);
-                            }
-                        }
-                        closest.1
-                    })))
-                    .display();
+                // Send data to the plotting thread
+                tx.send((frequencies, magnitudes)).expect("Failed to send data to plotting thread");
             }
         },
         err_fn,
@@ -72,9 +63,50 @@ fn main() {
 
     stream.play().expect("Failed to play stream");
 
-    std::thread::sleep(std::time::Duration::from_secs(10));
+    // Plotting thread
+    thread::spawn(move || {
+        loop {
+            // Receive data from the audio processing thread
+            if let Ok((frequencies, magnitudes)) = rx.recv() {
+                // Clear the terminal and get its size
+                print!("{}{}", clear::All, cursor::Goto(1, 1));
+                let (width, height) = terminal_size().unwrap_or((180, 40));
 
-    // Access the maximum decibel value outside the loop
-    let max_db_value = *max_db_value.lock().unwrap();
-    println!("Maximum Decibel Value: {:.2} dB", max_db_value);
+                // Calculate 90% of the terminal size
+                let width_90: u16 = ((width as f32 * 0.9) as u16).try_into().unwrap();
+                let height_90: u16 = ((height as f32 * 0.9) as u16).try_into().unwrap();
+
+                // Calculate padding to center the chart
+                let horizontal_padding = (width as u16 - width_90) / 2;
+                let vertical_padding = (height as u16 - height_90) / 2;
+
+                // Add padding
+                let plot_width = width_90 * 2;
+                let plot_height = height_90 * 2;
+
+                // Move cursor to start position with padding
+                print!("{}", cursor::Goto(horizontal_padding, vertical_padding));
+
+                // Plotting for debugging: Only within human voice range
+                println!("Frequency Spectrum (Human Voice Range):");
+                Chart::new(plot_width.into(), plot_height.into(), 0.0, 2400.0)
+                    .lineplot(&Shape::Continuous(Box::new(|x| {
+                        // Interpolate the normalized magnitude for the given frequency x
+                        let mut closest = (0.0, 0.0);
+                        for (&f, &m_norm) in frequencies.iter().zip(magnitudes.iter()) {
+                            if (f - x).abs() < (closest.0 - x).abs() {
+                                closest = (f, m_norm);
+                            }
+                        }
+                        closest.1
+                    })))
+                    .display();
+
+               
+            }
+        }
+    });
+
+    // Run indefinitely
+    thread::sleep(std::time::Duration::from_secs(100));
 }

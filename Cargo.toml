@@ -9,6 +9,9 @@ authors = ["Lyndon <lyndon@lyndon.dev>"]
 [dependencies]
 cargo-bundle = "0.6.1"
 cpal = "0.15.3"
+plotters = "0.3.7"
+rustfft = "6.2.0"
+textplots = "0.8.6"
 
 [package.metadata.bundle]
 name = "Whisper Test"

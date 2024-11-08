@@ -2,33 +2,33 @@ from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 import json
 import cv2
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans  # type: ignore
 
 # Expanded ASCII character set for finer gradation
 chars = ["@", "%", "#", "W", "&", "8", "B", "M", "K", "X", "D", "Q", "H", "A", "O", "Z", "U", "*", "+", "=", "-", ":", ".", " "]
 
-def resize_frame(image: Image, new_width: int = 150) -> Image:
+def resize_frame(image: Image.Image, new_width: int = 150) -> Image.Image:
     """Resizes the image for higher resolution ASCII output."""
     width, height = image.size
     aspect_ratio = height / width
     new_height = int(aspect_ratio * new_width * 0.55)
     return image.resize((new_width, new_height))
 
-def adaptive_thresholding(image: Image) -> Image:
+def adaptive_thresholding(image: Image.Image) -> Image.Image:
     """Applies adaptive thresholding to manage noise and preserve details."""
-    np_image = np.array(image)
+    np_image: np.ndarray = np.array(image)
     thresholded_image = cv2.adaptiveThreshold(np_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
     return Image.fromarray(thresholded_image)
 
-def bilateral_filtering(image: Image) -> Image:
+def bilateral_filtering(image: Image.Image) -> Image.Image:
     """Applies bilateral filtering for noise reduction while preserving edges."""
-    np_image = np.array(image)
+    np_image: np.ndarray = np.array(image)
     filtered_image = cv2.bilateralFilter(np_image, d=9, sigmaColor=75, sigmaSpace=75)
     return Image.fromarray(filtered_image)
 
-def clustering_character_mapping(image: Image, num_clusters: int = 8) -> np.ndarray:
+def clustering_character_mapping(image: Image.Image, num_clusters: int = 8) -> np.ndarray:
     """Clusters brightness levels and maps clusters to ASCII characters."""
-    np_image = np.array(image).reshape(-1, 1)
+    np_image: np.ndarray = np.array(image).reshape(-1, 1)
     kmeans = KMeans(n_clusters=num_clusters)
     kmeans.fit(np_image)
     
@@ -39,9 +39,9 @@ def clustering_character_mapping(image: Image, num_clusters: int = 8) -> np.ndar
     clustered_image = np.vectorize(cluster_mapping.get)(kmeans.labels_).reshape(image.size[::-1])
     return clustered_image
 
-def perceptual_brightness_mapping(image: Image) -> str:
+def perceptual_brightness_mapping(image: Image.Image) -> str:
     """Maps pixel brightness to ASCII characters with finer gradation."""
-    np_image = np.array(image)
+    np_image: np.ndarray = np.array(image)
     ascii_art = ""
     
     # Using expanded character set for smoother transitions

@@ -68,11 +68,30 @@ fn main() {
 
     stream.play().expect("Failed to play stream");
 
-    // Plotting thread
+    // Load ASCII GIF
+    let file_path = "ascii_gif_frames.json";
+    let mut last_modified_time: Option<SystemTime> = None;
+    let mut ascii_gif = load_ascii_gif(file_path).expect("Failed to load ASCII GIF");
+    let frame_delay = Duration::from_millis(ascii_gif.frame_duration);
+
+    // Plotting and ASCII GIF display loop
     thread::spawn(move || {
+        let mut frame_index = 0;
         loop {
-            // Receive data from the audio processing thread
-            if let Ok((frequencies, magnitudes)) = rx.recv() {
+            // Check if file has been modified
+            if let Ok(metadata) = fs::metadata(file_path) {
+                let modified_time = metadata.modified().expect("Failed to get modified time");
+
+                // Reload the JSON file if it has changed
+                if Some(modified_time) != last_modified_time {
+                    println!("File has changed, reloading...");
+                    ascii_gif = load_ascii_gif(file_path).expect("Failed to reload ASCII GIF");
+                    last_modified_time = Some(modified_time);
+                }
+            }
+
+            // Try to receive data from the audio processing thread without blocking
+            if let Ok((frequencies, magnitudes)) = rx.try_recv() {
                 // Clear the terminal and get its size
                 print!("{}{}", clear::All, cursor::Goto(1, 1));
                 let (width, height) = terminal_size().unwrap_or((180, 40));
@@ -106,8 +125,18 @@ fn main() {
                         closest.1
                     })))
                     .display();
-
             }
+
+            // Display the current ASCII frame
+            if let Some(frame) = ascii_gif.frames.get(frame_index) {
+                println!("{}", frame);
+            }
+
+            // Increment frame index and wrap around if necessary
+            frame_index = (frame_index + 1) % ascii_gif.frames.len();
+
+            // Sleep to match the frame rate of the ASCII GIF
+            thread::sleep(frame_delay);
         }
     });
 
@@ -128,35 +157,4 @@ fn load_ascii_gif(path: &str) -> Result<AsciiGif, Box<dyn std::error::Error>> {
     let data = fs::read_to_string(path)?;
     let ascii_gif: AsciiGif = serde_json::from_str(&data)?;
     Ok(ascii_gif)
-}
-
-fn ascii_gif_loop() -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = "ascii_gif_frames.json";
-    let mut last_modified_time: Option<SystemTime> = None;
-
-    let mut ascii_gif = load_ascii_gif(file_path)?;
-    let frame_delay = Duration::from_millis(ascii_gif.frame_duration);
-    let loop_delay = Duration::from_millis(500); // Optional delay between loops
-
-    loop {
-        // Check if file has been modified
-        if let Ok(metadata) = fs::metadata(file_path) {
-            let modified_time = metadata.modified()?;
-
-            // Reload the JSON file if it has changed
-            if Some(modified_time) != last_modified_time {
-                println!("File has changed, reloading...");
-                ascii_gif = load_ascii_gif(file_path)?;
-                last_modified_time = Some(modified_time);
-            }
-        }
-
-        // Display frames in a loop
-        for frame in &ascii_gif.frames {
-            execute!(stdout(), Clear(ClearType::All))?;
-            println!("{}", frame);
-            thread::sleep(frame_delay);
-        }
-
-    }
 }

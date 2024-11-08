@@ -5,9 +5,14 @@ use textplots::{Chart, Plot, Shape};
 use std::sync::{Arc, Mutex};
 use termion::{clear, cursor};
 use termion::terminal_size;
-use std::thread;
 use std::sync::mpsc;
 use std::convert::TryInto;
+
+use serde::Deserialize;
+use std::{fs, thread, time::Duration, time::SystemTime};
+use std::io::{stdout, Write};
+use crossterm::{execute, terminal::{Clear, ClearType}};
+use std::path::Path;
 
 fn main() {
     let host = cpal::default_host();
@@ -102,11 +107,56 @@ fn main() {
                     })))
                     .display();
 
-               
             }
         }
     });
 
     // Run indefinitely
     thread::sleep(std::time::Duration::from_secs(100));
+}
+
+
+
+#[derive(Deserialize)]
+struct AsciiGif {
+    frame_duration: u64,  // Frame duration in milliseconds
+    frames: Vec<String>,
+}
+
+// Function to load JSON file and return AsciiGif struct
+fn load_ascii_gif(path: &str) -> Result<AsciiGif, Box<dyn std::error::Error>> {
+    let data = fs::read_to_string(path)?;
+    let ascii_gif: AsciiGif = serde_json::from_str(&data)?;
+    Ok(ascii_gif)
+}
+
+fn ascii_gif_loop() -> Result<(), Box<dyn std::error::Error>> {
+    let file_path = "ascii_gif_frames.json";
+    let mut last_modified_time: Option<SystemTime> = None;
+
+    let mut ascii_gif = load_ascii_gif(file_path)?;
+    let frame_delay = Duration::from_millis(ascii_gif.frame_duration);
+    let loop_delay = Duration::from_millis(500); // Optional delay between loops
+
+    loop {
+        // Check if file has been modified
+        if let Ok(metadata) = fs::metadata(file_path) {
+            let modified_time = metadata.modified()?;
+
+            // Reload the JSON file if it has changed
+            if Some(modified_time) != last_modified_time {
+                println!("File has changed, reloading...");
+                ascii_gif = load_ascii_gif(file_path)?;
+                last_modified_time = Some(modified_time);
+            }
+        }
+
+        // Display frames in a loop
+        for frame in &ascii_gif.frames {
+            execute!(stdout(), Clear(ClearType::All))?;
+            println!("{}", frame);
+            thread::sleep(frame_delay);
+        }
+
+    }
 }

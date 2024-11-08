@@ -1,17 +1,27 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
-use textplots::{Chart, Plot, Shape};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use termion::{clear, cursor};
-use termion::terminal_size;
 use std::sync::mpsc;
-use std::convert::TryInto;
+use tui::backend::CrosstermBackend;
+use tui::Terminal;
+use tui::widgets::{Block, Borders, Paragraph, Chart, Axis, Dataset};
+use tui::layout::{Layout, Constraint, Direction};
+use tui::style::{Style, Color};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-fn main() {
     let host = cpal::default_host();
     let device = host.default_input_device().expect("Failed to get input device");
     let config = device.default_input_config().expect("Failed to get default config");
@@ -67,47 +77,46 @@ fn main() {
 
     // 60 FPS
     let frame_delay = Duration::from_millis(16); 
-  
+
     // Plotting and ASCII GIF display loop
+    let terminal = Arc::new(Mutex::new(terminal)); // Wrap terminal in Arc<Mutex<>>
+    let terminal_clone = Arc::clone(&terminal);
     thread::spawn(move || {
         loop {
-
-
             // Try to receive data from the audio processing thread without blocking
             if let Ok((frequencies, magnitudes)) = rx.try_recv() {
-                // Clear the terminal and get its size
-                print!("{}{}", clear::All, cursor::Goto(1, 1));
-                let (width, height) = terminal_size().unwrap_or((180, 40));
+                let data: Vec<(f64, f64)> = frequencies.iter().zip(magnitudes.iter()).map(|(&f, &m)| (f as f64, m as f64)).collect(); // Store in a variable
+                let mut terminal = terminal_clone.lock().unwrap(); // Lock the terminal for drawing
+                terminal.draw(|f| {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .margin(1)
+                        .constraints(
+                            [
+                                Constraint::Percentage(70),
+                                Constraint::Percentage(30),
+                            ]
+                            .as_ref(),
+                        )
+                        .split(f.size());
 
-                // Calculate 90% of the terminal size
-                let width_90: u16 = ((width as f32 * 0.9) as u16).try_into().unwrap();
-                let height_90: u16 = ((height as f32 * 0.9) as u16).try_into().unwrap();
+                    let chart = Chart::new(vec![
+                        Dataset::default()
+                            .name("Frequency Spectrum")
+                            .marker(tui::symbols::Marker::Dot)
+                            .style(Style::default().fg(Color::Cyan))
+                            .data(&data), // Use the stored data
+                    ])
+                    .block(Block::default().title("Frequency Spectrum").borders(Borders::ALL))
+                    .x_axis(Axis::default().title("Frequency").bounds([0.0, 2400.0]))
+                    .y_axis(Axis::default().title("Magnitude").bounds([0.0, 1.0]));
 
-                // Calculate padding to center the chart
-                let horizontal_padding = (width as u16 - width_90) / 2;
-                let vertical_padding = (height as u16 - height_90) / 2;
+                    f.render_widget(chart, chunks[0]);
 
-                // Add padding
-                let plot_width = width_90 * 2;
-                let plot_height = height_90 * 2;
-
-                // Move cursor to start position with padding
-                print!("{}", cursor::Goto(horizontal_padding, vertical_padding));
-
-                // Plotting for debugging: Only within human voice range
-                println!("Frequency Spectrum (Human Voice Range):");
-                Chart::new(plot_width.into(), plot_height.into(), 0.0, 2400.0)
-                    .lineplot(&Shape::Continuous(Box::new(|x| {
-                        // Interpolate the normalized magnitude for the given frequency x
-                        let mut closest = (0.0, 0.0);
-                        for (&f, &m_norm) in frequencies.iter().zip(magnitudes.iter()) {
-                            if (f - x).abs() < (closest.0 - x).abs() {
-                                closest = (f, m_norm);
-                            }
-                        }
-                        closest.1
-                    })))
-                    .display();
+                    let text = Paragraph::new(format!("Max dB: {:.2}", *max_db_value.lock().unwrap()))
+                        .block(Block::default().title("Info").borders(Borders::ALL));
+                    f.render_widget(text, chunks[1]);
+                }).unwrap();
             }
 
             // Sleep for the frame delay
@@ -116,6 +125,25 @@ fn main() {
     });
 
     // Run indefinitely
-    thread::sleep(std::time::Duration::from_secs(100));
+    loop {
+        if event::poll(frame_delay)? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.lock().unwrap().backend_mut(), // Lock the terminal for restoration
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.lock().unwrap().show_cursor()?; // Lock the terminal for cursor display
+
+    Ok(())
 }
 

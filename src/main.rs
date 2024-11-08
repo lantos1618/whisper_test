@@ -3,16 +3,13 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 use textplots::{Chart, Plot, Shape};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use termion::{clear, cursor};
 use termion::terminal_size;
 use std::sync::mpsc;
 use std::convert::TryInto;
 
-use serde::Deserialize;
-use std::{fs, thread, time::Duration, time::SystemTime};
-use std::io::{stdout, Write};
-use crossterm::{execute, terminal::{Clear, ClearType}};
-use std::path::Path;
 
 fn main() {
     let host = cpal::default_host();
@@ -68,27 +65,13 @@ fn main() {
 
     stream.play().expect("Failed to play stream");
 
-    // Load ASCII GIF
-    let file_path = "ascii_gif_frames.json";
-    let mut last_modified_time: Option<SystemTime> = None;
-    let mut ascii_gif = load_ascii_gif(file_path).expect("Failed to load ASCII GIF");
-    let frame_delay = Duration::from_millis(ascii_gif.frame_duration);
-
+    // 60 FPS
+    let frame_delay = Duration::from_millis(16); 
+  
     // Plotting and ASCII GIF display loop
     thread::spawn(move || {
-        let mut frame_index = 0;
         loop {
-            // Check if file has been modified
-            if let Ok(metadata) = fs::metadata(file_path) {
-                let modified_time = metadata.modified().expect("Failed to get modified time");
 
-                // Reload the JSON file if it has changed
-                if Some(modified_time) != last_modified_time {
-                    println!("File has changed, reloading...");
-                    ascii_gif = load_ascii_gif(file_path).expect("Failed to reload ASCII GIF");
-                    last_modified_time = Some(modified_time);
-                }
-            }
 
             // Try to receive data from the audio processing thread without blocking
             if let Ok((frequencies, magnitudes)) = rx.try_recv() {
@@ -127,15 +110,7 @@ fn main() {
                     .display();
             }
 
-            // Display the current ASCII frame
-            if let Some(frame) = ascii_gif.frames.get(frame_index) {
-                println!("{}", frame);
-            }
-
-            // Increment frame index and wrap around if necessary
-            frame_index = (frame_index + 1) % ascii_gif.frames.len();
-
-            // Sleep to match the frame rate of the ASCII GIF
+            // Sleep for the frame delay
             thread::sleep(frame_delay);
         }
     });
@@ -144,17 +119,3 @@ fn main() {
     thread::sleep(std::time::Duration::from_secs(100));
 }
 
-
-
-#[derive(Deserialize)]
-struct AsciiGif {
-    frame_duration: u64,  // Frame duration in milliseconds
-    frames: Vec<String>,
-}
-
-// Function to load JSON file and return AsciiGif struct
-fn load_ascii_gif(path: &str) -> Result<AsciiGif, Box<dyn std::error::Error>> {
-    let data = fs::read_to_string(path)?;
-    let ascii_gif: AsciiGif = serde_json::from_str(&data)?;
-    Ok(ascii_gif)
-}

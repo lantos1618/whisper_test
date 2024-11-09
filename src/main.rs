@@ -15,6 +15,71 @@ use tui::style::{Color, Style};
 use tui::widgets::{Axis, Block, Borders, Chart, Dataset, Paragraph};
 use tui::Terminal;
 use kanal::bounded;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc as StdArc;
+use ctrlc;
+
+// Include the generated bindings
+// you need to enable vscode rust-analyzer.cargo.runBuildScripts to run this
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+// Define a struct to encapsulate the Opus encoder
+struct SafeOpusEncoder {
+    encoder: *mut OpusEncoder,
+}
+
+unsafe impl Send for SafeOpusEncoder {}
+
+impl SafeOpusEncoder {
+    fn new(sample_rate: i32, channels: i32) -> Self {
+        let encoder = unsafe { opus_encoder_create(sample_rate, channels, OPUS_APPLICATION_AUDIO as i32, &mut 0) };
+        SafeOpusEncoder { encoder }
+    }
+
+    fn encode(&self, pcm_data: &[i16], opus_buffer: &mut [u8]) -> i32 {
+        unsafe {
+            opus_encode(self.encoder, pcm_data.as_ptr(), FRAME_SIZE, opus_buffer.as_mut_ptr(), opus_buffer.len() as i32)
+        }
+    }
+}
+
+impl Drop for SafeOpusEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            opus_encoder_destroy(self.encoder);
+        }
+    }
+}
+
+// Define a struct to encapsulate the Opus decoder
+struct SafeOpusDecoder {
+    decoder: *mut OpusDecoder,
+}
+
+unsafe impl Send for SafeOpusDecoder {}
+
+impl SafeOpusDecoder {
+    fn new(sample_rate: i32, channels: i32) -> Self {
+        let decoder = unsafe { opus_decoder_create(sample_rate, channels, &mut 0) };
+        SafeOpusDecoder { decoder }
+    }
+
+    fn decode(&self, opus_buffer: &[u8], pcm_out: &mut [i16]) -> i32 {
+        unsafe {
+            opus_decode(self.decoder, opus_buffer.as_ptr(), opus_buffer.len() as i32, pcm_out.as_mut_ptr(), FRAME_SIZE, 0)
+        }
+    }
+}
+
+impl Drop for SafeOpusDecoder {
+    fn drop(&mut self) {
+        unsafe {
+            opus_decoder_destroy(self.decoder);
+        }
+    }
+}
+
+const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
@@ -40,16 +105,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Kanal channel for sending data to the plotting thread
     let (tx, rx) = bounded(10);
 
+    // Initialize Opus encoder and decoder
+    let sample_rate = config.sample_rate().0 as i32;
+    let channels = 1; // Assuming mono audio
+    let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)));
+    let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)));
+
+    // Wrap the encoder and decoder in Arc<Mutex<>>
+    let opus_encoder = Arc::new(Mutex::new(opus_encoder));
+    let opus_decoder = Arc::new(Mutex::new(opus_decoder));
+
+    // Flag to indicate when to exit
+    let running = StdArc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    // Setup Ctrl+C handler
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    // Clone `running` for use in the thread
+    let running_clone = running.clone();
+
     let stream = device
         .build_input_stream(
             &config.clone().into(),
             {
                 let max_db_value = Arc::clone(&max_db_value);
                 let tx = tx.clone();
+                let opus_encoder = Arc::clone(&opus_encoder);
+                let opus_decoder = Arc::clone(&opus_decoder);
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Convert f32 samples to i16 for Opus encoding
+                    let pcm_data: Vec<i16> = data.iter().map(|&x| (x * 32767.0) as i16).collect();
+
+                    // Prepare buffer for encoded data
+                    let mut opus_buffer = vec![0; 4000]; // Adjust size as needed
+
+                    // Encode the PCM data
+                    let encoded_bytes = {
+                        let encoder_lock = opus_encoder.lock().unwrap();
+                        let encoder = encoder_lock.lock().unwrap();
+                        encoder.encode(&pcm_data, &mut opus_buffer)
+                    };
+
+                    if encoded_bytes < 0 {
+                        let error_message = unsafe { std::ffi::CStr::from_ptr(opus_strerror(encoded_bytes)) }
+                            .to_string_lossy()
+                            .into_owned();
+                        eprintln!("Encode failed: {}", error_message);
+                        return;
+                    }
+
+                    // Decode the compressed data
+                    let mut pcm_out = vec![0; FRAME_SIZE as usize];
+                    let frame_size = {
+                        let decoder_lock = opus_decoder.lock().unwrap();
+                        let decoder = decoder_lock.lock().unwrap();
+                        decoder.decode(&opus_buffer[..encoded_bytes as usize], &mut pcm_out)
+                    };
+
+                    if frame_size < 0 {
+                        let error_message = unsafe { std::ffi::CStr::from_ptr(opus_strerror(frame_size)) }
+                            .to_string_lossy()
+                            .into_owned();
+                        eprintln!("Decode failed: {}", error_message);
+                        return;
+                    }
+
+                    // You can now use `pcm_out` as your decoded audio data
+                    // For example, you could process it further or play it back
+
                     // Increase the FFT size by zero-padding the input data
                     let fft_size = 8192;
-                    // let fft_size = 4096;
                     let mut buffer: Vec<Complex<f32>> =
                         data.iter().map(|&x| Complex::new(x, 0.0)).collect();
                     buffer.resize(fft_size, Complex::new(0.0, 0.0)); // Zero-padding
@@ -99,6 +227,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     thread::spawn(move || {
         loop {
+            if !running_clone.load(Ordering::SeqCst) {
+                break;
+            }
             // Try to receive data from the audio processing thread without blocking
             if let Ok((frequencies, magnitudes)) = rx.recv() {
                 let data: Vec<(f64, f64)> = frequencies
@@ -157,6 +288,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run indefinitely
     loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         if event::poll(frame_delay)? {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q') {
@@ -174,6 +308,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DisableMouseCapture
     )?;
     terminal.lock().unwrap().show_cursor()?; // Lock the terminal for cursor display
+
+    // Clean up Opus encoder and decoder
+    unsafe {
+        let encoder_lock = opus_encoder.lock().unwrap();
+        let encoder = encoder_lock.lock().unwrap();
+        opus_encoder_destroy(encoder.encoder);
+
+        let decoder_lock = opus_decoder.lock().unwrap();
+        let decoder = decoder_lock.lock().unwrap();
+        opus_decoder_destroy(decoder.decoder);
+    }
 
     Ok(())
 }

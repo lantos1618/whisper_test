@@ -1,15 +1,15 @@
-
-
 [package]
 name = "whisper_test"
 version = "0.1.0"
 edition = "2021"
 authors = ["Lyndon <lyndon@lyndon.dev>"]
+build = "build.rs"
 
 [dependencies]
 cargo-bundle = "0.6.1"
 cpal = "0.15.3"
 crossterm = "0.28.1"
+ctrlc = "3.4.5"
 kanal = "0.1.0-pre8"
 plotters = "0.3.7"
 rustfft = "6.2.0"
@@ -31,3 +31,7 @@ info_plist = "Info.plist"
 
 [profile.release]
 opt-level = 3
+
+[build-dependencies]
+bindgen = "0.65.1"
+cc = "1.0"

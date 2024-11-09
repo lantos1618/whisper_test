@@ -16,7 +16,6 @@ use tui::widgets::{Axis, Block, Borders, Chart, Dataset, Paragraph};
 use tui::Terminal;
 use kanal::bounded;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc as StdArc;
 use ctrlc;
 
 // Include the generated bindings
@@ -105,18 +104,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Kanal channel for sending data to the plotting thread
     let (tx, rx) = bounded(10);
 
+    // Create a channel for passing PCM data to the encoding thread
+    let (pcm_tx, pcm_rx) = kanal::bounded::<Vec<i16>>(10);
+
+    // Create a channel for passing encoded data to the decoding thread
+    let (encoded_tx, encoded_rx) = kanal::bounded(10);
+
     // Initialize Opus encoder and decoder
     let sample_rate = config.sample_rate().0 as i32;
     let channels = 1; // Assuming mono audio
     let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)));
     let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)));
 
-    // Wrap the encoder and decoder in Arc<Mutex<>>
-    let opus_encoder = Arc::new(Mutex::new(opus_encoder));
-    let opus_decoder = Arc::new(Mutex::new(opus_decoder));
+    // Spawn a thread for encoding
+    thread::spawn({
+        let opus_encoder = Arc::clone(&opus_encoder);
+        move || {
+            while let Ok(pcm_data) = pcm_rx.recv() {
+                let mut opus_buffer = vec![0; 4000];
+                let encoded_bytes = opus_encoder.lock().unwrap().encode(&pcm_data, &mut opus_buffer);
+                if encoded_bytes > 0 {
+                    encoded_tx.send(opus_buffer[..encoded_bytes as usize].to_vec()).unwrap();
+                }
+            }
+        }
+    });
+
+    // Spawn a thread for decoding
+    thread::spawn({
+        let opus_decoder = Arc::clone(&opus_decoder);
+        move || {
+            while let Ok(encoded_data) = encoded_rx.recv() {
+                let mut pcm_out = vec![0; FRAME_SIZE as usize];
+                opus_decoder.lock().unwrap().decode(&encoded_data, &mut pcm_out);
+                // Process or play back pcm_out
+            }
+        }
+    });
 
     // Flag to indicate when to exit
-    let running = StdArc::new(AtomicBool::new(true));
+    let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
     // Setup Ctrl+C handler
@@ -132,49 +159,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config.clone().into(),
             {
                 let max_db_value = Arc::clone(&max_db_value);
-                let tx = tx.clone();
-                let opus_encoder = Arc::clone(&opus_encoder);
-                let opus_decoder = Arc::clone(&opus_decoder);
+                let pcm_tx = pcm_tx.clone();
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     // Convert f32 samples to i16 for Opus encoding
                     let pcm_data: Vec<i16> = data.iter().map(|&x| (x * 32767.0) as i16).collect();
-
-                    // Prepare buffer for encoded data
-                    let mut opus_buffer = vec![0; 4000]; // Adjust size as needed
-
-                    // Encode the PCM data
-                    let encoded_bytes = {
-                        let encoder_lock = opus_encoder.lock().unwrap();
-                        let encoder = encoder_lock.lock().unwrap();
-                        encoder.encode(&pcm_data, &mut opus_buffer)
-                    };
-
-                    if encoded_bytes < 0 {
-                        let error_message = unsafe { std::ffi::CStr::from_ptr(opus_strerror(encoded_bytes)) }
-                            .to_string_lossy()
-                            .into_owned();
-                        eprintln!("Encode failed: {}", error_message);
-                        return;
-                    }
-
-                    // Decode the compressed data
-                    let mut pcm_out = vec![0; FRAME_SIZE as usize];
-                    let frame_size = {
-                        let decoder_lock = opus_decoder.lock().unwrap();
-                        let decoder = decoder_lock.lock().unwrap();
-                        decoder.decode(&opus_buffer[..encoded_bytes as usize], &mut pcm_out)
-                    };
-
-                    if frame_size < 0 {
-                        let error_message = unsafe { std::ffi::CStr::from_ptr(opus_strerror(frame_size)) }
-                            .to_string_lossy()
-                            .into_owned();
-                        eprintln!("Decode failed: {}", error_message);
-                        return;
-                    }
-
-                    // You can now use `pcm_out` as your decoded audio data
-                    // For example, you could process it further or play it back
+                    pcm_tx.send(pcm_data).unwrap();
 
                     // Increase the FFT size by zero-padding the input data
                     let fft_size = 8192;
@@ -311,12 +300,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Clean up Opus encoder and decoder
     unsafe {
-        let encoder_lock = opus_encoder.lock().unwrap();
-        let encoder = encoder_lock.lock().unwrap();
+        let encoder = opus_encoder.lock().unwrap();
         opus_encoder_destroy(encoder.encoder);
 
-        let decoder_lock = opus_decoder.lock().unwrap();
-        let decoder = decoder_lock.lock().unwrap();
+        let decoder = opus_decoder.lock().unwrap();
         opus_decoder_destroy(decoder.decoder);
     }
 

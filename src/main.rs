@@ -6,7 +6,6 @@ use crossterm::terminal::{
 };
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -15,6 +14,7 @@ use tui::layout::{Constraint, Direction, Layout};
 use tui::style::{Color, Style};
 use tui::widgets::{Axis, Block, Borders, Chart, Dataset, Paragraph};
 use tui::Terminal;
+use kanal::bounded;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
@@ -37,8 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared state for the maximum decibel value
     let max_db_value = Arc::new(Mutex::new(f32::NEG_INFINITY));
 
-    // Channel for sending data to the plotting thread
-    let (tx, rx) = mpsc::sync_channel(10);
+    // Kanal channel for sending data to the plotting thread
+    let (tx, rx) = bounded(10);
 
     let stream = device
         .build_input_stream(
@@ -48,7 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tx = tx.clone();
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     // Increase the FFT size by zero-padding the input data
-                    let fft_size = 4096;
+                    let fft_size = 8192;
+                    // let fft_size = 4096;
                     let mut buffer: Vec<Complex<f32>> =
                         data.iter().map(|&x| Complex::new(x, 0.0)).collect();
                     buffer.resize(fft_size, Complex::new(0.0, 0.0)); // Zero-padding
@@ -88,8 +89,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     stream.play().expect("Failed to play stream");
 
-    // 60 FPS
-    let frame_delay = Duration::from_millis(16);
+    // 60 fps = 16.6' ms, 100 fps = 10 ms, 120 fps = 8.3 ms
+    let frame_delay = Duration::from_millis(8);
     let fps = 1000 / frame_delay.as_millis(); // Calculate FPS
 
     // Plotting and ASCII GIF display loop
@@ -99,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::spawn(move || {
         loop {
             // Try to receive data from the audio processing thread without blocking
-            if let Ok((frequencies, magnitudes)) = rx.try_recv() {
+            if let Ok((frequencies, magnitudes)) = rx.recv() {
                 let data: Vec<(f64, f64)> = frequencies
                     .iter()
                     .zip(magnitudes.iter())

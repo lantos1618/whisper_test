@@ -17,6 +17,9 @@ use tui::Terminal;
 use kanal::bounded;
 use std::sync::atomic::{AtomicBool, Ordering};
 use ctrlc;
+use anyhow::{Context, Result};
+mod error;
+use error::AudioError;
 
 // Include the generated bindings
 // you need to enable vscode rust-analyzer.cargo.runBuildScripts to run this
@@ -30,15 +33,34 @@ struct SafeOpusEncoder {
 unsafe impl Send for SafeOpusEncoder {}
 
 impl SafeOpusEncoder {
-    fn new(sample_rate: i32, channels: i32) -> Self {
-        let encoder = unsafe { opus_encoder_create(sample_rate, channels, OPUS_APPLICATION_AUDIO as i32, &mut 0) };
-        SafeOpusEncoder { encoder }
+    fn new(sample_rate: i32, channels: i32) -> Result<Self> {
+        let mut error = 0;
+        let encoder = unsafe { 
+            opus_encoder_create(sample_rate, channels, OPUS_APPLICATION_AUDIO as i32, &mut error) 
+        };
+        
+        if error != 0 {
+            return Err(AudioError::OpusEncodeError(error)).context("Failed to create Opus encoder");
+        }
+        
+        Ok(SafeOpusEncoder { encoder })
     }
 
-    fn encode(&self, pcm_data: &[i16], opus_buffer: &mut [u8]) -> i32 {
-        unsafe {
-            opus_encode(self.encoder, pcm_data.as_ptr(), FRAME_SIZE, opus_buffer.as_mut_ptr(), opus_buffer.len() as i32)
+    fn encode(&self, pcm_data: &[i16], opus_buffer: &mut [u8]) -> Result<i32> {
+        let result = unsafe {
+            opus_encode(
+                self.encoder,
+                pcm_data.as_ptr(),
+                FRAME_SIZE,
+                opus_buffer.as_mut_ptr(),
+                opus_buffer.len() as i32
+            )
+        };
+
+        if result < 0 {
+            return Err(AudioError::OpusEncodeError(result)).context("Failed to encode audio data");
         }
+        Ok(result)
     }
 }
 
@@ -58,15 +80,35 @@ struct SafeOpusDecoder {
 unsafe impl Send for SafeOpusDecoder {}
 
 impl SafeOpusDecoder {
-    fn new(sample_rate: i32, channels: i32) -> Self {
-        let decoder = unsafe { opus_decoder_create(sample_rate, channels, &mut 0) };
-        SafeOpusDecoder { decoder }
+    fn new(sample_rate: i32, channels: i32) -> Result<Self> {
+        let mut error = 0;
+        let decoder = unsafe { 
+            opus_decoder_create(sample_rate, channels, &mut error) 
+        };
+        
+        if error != 0 {
+            return Err(AudioError::OpusDecodeError(error)).context("Failed to create Opus decoder");
+        }
+        
+        Ok(SafeOpusDecoder { decoder })
     }
 
-    fn decode(&self, opus_buffer: &[u8], pcm_out: &mut [i16]) -> i32 {
-        unsafe {
-            opus_decode(self.decoder, opus_buffer.as_ptr(), opus_buffer.len() as i32, pcm_out.as_mut_ptr(), FRAME_SIZE, 0)
+    fn decode(&self, opus_buffer: &[u8], pcm_out: &mut [i16]) -> Result<i32> {
+        let result = unsafe {
+            opus_decode(
+                self.decoder,
+                opus_buffer.as_ptr(),
+                opus_buffer.len() as i32,
+                pcm_out.as_mut_ptr(),
+                FRAME_SIZE,
+                0
+            )
+        };
+
+        if result < 0 {
+            return Err(AudioError::OpusDecodeError(result)).context("Failed to decode audio data");
         }
+        Ok(result)
     }
 }
 
@@ -80,12 +122,13 @@ impl Drop for SafeOpusDecoder {
 
 const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>, Box<dyn std::error::Error>> {
-    enable_raw_mode()?;
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+    enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("Failed to execute terminal commands")?;
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    Terminal::new(backend).context("Failed to create terminal")
 }
 
 fn setup_audio_stream(
@@ -94,15 +137,12 @@ fn setup_audio_stream(
     tx: kanal::Sender<(Vec<f32>, Vec<f32>)>,
     config: cpal::StreamConfig,
     device: cpal::Device,
-) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
-    let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
-
+) -> Result<cpal::Stream> {
     let stream = device.build_input_stream(
         &config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Convert f32 samples to i16 for Opus encoding
             let pcm_data: Vec<i16> = data.iter().map(|&x| (x * 32767.0) as i16).collect();
-            pcm_tx.send(pcm_data).unwrap();
+            pcm_tx.send(pcm_data).expect("Failed to send PCM data");
 
             // Increase the FFT size by zero-padding the input data
             let fft_size = 8192;
@@ -130,11 +170,12 @@ fn setup_audio_stream(
             }
 
             // Send data to the plotting thread
-            tx.send((frequencies, magnitudes)).expect("Failed to send data to plotting thread");
+            tx.send((frequencies, magnitudes))
+                .expect("Failed to send FFT data");
         },
-        err_fn,
+        |err| eprintln!("Stream error: {}", err),
         None,
-    )?;
+    ).context("Failed to build input stream")?;
 
     Ok(stream)
 }
@@ -143,14 +184,22 @@ fn encoding_thread(
     opus_encoder: Arc<Mutex<SafeOpusEncoder>>,
     pcm_rx: kanal::Receiver<Vec<i16>>,
     encoded_tx: kanal::Sender<Vec<u8>>,
-) {
+) -> Result<()> {
     while let Ok(pcm_data) = pcm_rx.recv() {
         let mut opus_buffer = vec![0; 4000];
-        let encoded_bytes = opus_encoder.lock().unwrap().encode(&pcm_data, &mut opus_buffer);
+        let encoded_bytes = opus_encoder
+            .lock()
+            .unwrap()
+            .encode(&pcm_data, &mut opus_buffer)
+            .context("Failed to encode audio")?;
+            
         if encoded_bytes > 0 {
-            encoded_tx.send(opus_buffer[..encoded_bytes as usize].to_vec()).unwrap();
+            encoded_tx
+                .send(opus_buffer[..encoded_bytes as usize].to_vec())
+                .context("Failed to send encoded data")?;
         }
     }
+    Ok(())
 }
 
 fn decoding_thread(
@@ -216,11 +265,15 @@ fn plotting_thread(
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let terminal = setup_terminal()?;
     let host = cpal::default_host();
-    let device = host.default_input_device().expect("Failed to get input device");
-    let config = device.default_input_config().expect("Failed to get default config");
+    let device = host
+        .default_input_device()
+        .context("Failed to get input device")?;
+    let config = device
+        .default_input_config()
+        .context("Failed to get default config")?;
 
     // Shared state for the maximum decibel value
     let max_db_value = Arc::new(Mutex::new(f32::NEG_INFINITY));
@@ -234,11 +287,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a channel for passing encoded data to the decoding thread
     let (encoded_tx, encoded_rx) = kanal::bounded(10);
 
-    // Initialize Opus encoder and decoder
+    // Initialize Opus encoder and decoder with proper error handling
     let sample_rate = config.sample_rate().0 as i32;
     let channels = 1; // Assuming mono audio
-    let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)));
-    let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)));
+    let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)?));
+    let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)?));
 
     // Spawn threads
     thread::spawn({

@@ -205,12 +205,13 @@ fn encoding_thread(
 fn decoding_thread(
     opus_decoder: Arc<Mutex<SafeOpusDecoder>>,
     encoded_rx: kanal::Receiver<Vec<u8>>,
-) {
+) -> Result<()> {
     while let Ok(encoded_data) = encoded_rx.recv() {
         let mut pcm_out = vec![0; FRAME_SIZE as usize];
         opus_decoder.lock().unwrap().decode(&encoded_data, &mut pcm_out);
         // Process or play back pcm_out
     }
+    Ok(())
 }
 
 fn plotting_thread(
@@ -293,15 +294,16 @@ fn main() -> Result<()> {
     let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)?));
     let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)?));
 
-    // Spawn threads
-    thread::spawn({
-        let opus_encoder = Arc::clone(&opus_encoder);
+    let handles = vec![
+        thread::spawn({
+            let opus_encoder = Arc::clone(&opus_encoder);
         move || encoding_thread(opus_encoder, pcm_rx, encoded_tx)
-    });
-    thread::spawn({
-        let opus_decoder = Arc::clone(&opus_decoder);
-        move || decoding_thread(opus_decoder, encoded_rx)
-    });
+        }),
+        thread::spawn({
+            let opus_decoder = Arc::clone(&opus_decoder);
+            move || decoding_thread(opus_decoder, encoded_rx)
+        }),
+    ];
 
     // Flag to indicate when to exit
     let running = Arc::new(AtomicBool::new(true));

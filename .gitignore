@@ -1,4 +1,4 @@
 /target
 .DS_Store
 .mypy_cache
-.out_dir
+out_dir.txt

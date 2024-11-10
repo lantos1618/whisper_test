@@ -80,23 +80,147 @@ impl Drop for SafeOpusDecoder {
 
 const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup terminal
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
+    Ok(Terminal::new(backend)?)
+}
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .expect("Failed to get input device");
-    let config = device
-        .default_input_config()
-        .expect("Failed to get default config");
-
+fn setup_audio_stream(
+    pcm_tx: kanal::Sender<Vec<i16>>,
+    max_db_value: Arc<Mutex<f32>>,
+    tx: kanal::Sender<(Vec<f32>, Vec<f32>)>,
+    config: cpal::StreamConfig,
+    device: cpal::Device,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+
+    let stream = device.build_input_stream(
+        &config,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            // Convert f32 samples to i16 for Opus encoding
+            let pcm_data: Vec<i16> = data.iter().map(|&x| (x * 32767.0) as i16).collect();
+            pcm_tx.send(pcm_data).unwrap();
+
+            // Increase the FFT size by zero-padding the input data
+            let fft_size = 8192;
+            let mut buffer: Vec<Complex<f32>> = data.iter().map(|&x| Complex::new(x, 0.0)).collect();
+            buffer.resize(fft_size, Complex::new(0.0, 0.0)); // Zero-padding
+
+            // Create an FFT planner and perform the FFT
+            let mut planner = FftPlanner::new();
+            let fft = planner.plan_fft_forward(buffer.len());
+            fft.process(&mut buffer);
+
+            // Calculate magnitudes and frequencies
+            let magnitudes: Vec<f32> = buffer.iter().map(|c| c.norm()).collect();
+            let sample_rate = config.sample_rate.0 as f32;
+            let frequencies: Vec<f32> = (0..buffer.len()).map(|i| i as f32 * sample_rate / buffer.len() as f32).collect();
+
+            // Update maximum decibel value to track highest signal
+            {
+                let mut max_db_lock = max_db_value.lock().unwrap();
+                let max_magnitude = magnitudes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let max_db = 20.0 * max_magnitude.log10();
+                if max_db > *max_db_lock {
+                    *max_db_lock = max_db;
+                }
+            }
+
+            // Send data to the plotting thread
+            tx.send((frequencies, magnitudes)).expect("Failed to send data to plotting thread");
+        },
+        err_fn,
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn encoding_thread(
+    opus_encoder: Arc<Mutex<SafeOpusEncoder>>,
+    pcm_rx: kanal::Receiver<Vec<i16>>,
+    encoded_tx: kanal::Sender<Vec<u8>>,
+) {
+    while let Ok(pcm_data) = pcm_rx.recv() {
+        let mut opus_buffer = vec![0; 4000];
+        let encoded_bytes = opus_encoder.lock().unwrap().encode(&pcm_data, &mut opus_buffer);
+        if encoded_bytes > 0 {
+            encoded_tx.send(opus_buffer[..encoded_bytes as usize].to_vec()).unwrap();
+        }
+    }
+}
+
+fn decoding_thread(
+    opus_decoder: Arc<Mutex<SafeOpusDecoder>>,
+    encoded_rx: kanal::Receiver<Vec<u8>>,
+) {
+    while let Ok(encoded_data) = encoded_rx.recv() {
+        let mut pcm_out = vec![0; FRAME_SIZE as usize];
+        opus_decoder.lock().unwrap().decode(&encoded_data, &mut pcm_out);
+        // Process or play back pcm_out
+    }
+}
+
+fn plotting_thread(
+    rx: kanal::Receiver<(Vec<f32>, Vec<f32>)>,
+    terminal: Arc<Mutex<Terminal<CrosstermBackend<std::io::Stdout>>>>,
+    max_db_value: Arc<Mutex<f32>>,
+    running: Arc<AtomicBool>,
+    frame_delay: Duration,
+    fps: u128,
+) {
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        // Try to receive data from the audio processing thread without blocking
+        if let Ok((frequencies, magnitudes)) = rx.recv() {
+            let data: Vec<(f64, f64)> = frequencies.iter().zip(magnitudes.iter()).map(|(&f, &m)| (f as f64, m as f64)).collect(); // Store in a variable
+            let mut terminal = terminal.lock().unwrap(); // Lock the terminal for drawing
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+                    .split(f.size());
+
+                // Get the current max decibel value
+                let max_db = *max_db_value.lock().unwrap();
+                // Calculate the y-axis upper bound based on max_db
+                let y_axis_upper_bound = (max_db / 20.0).exp(); // Convert dB to linear scale
+
+                let chart = Chart::new(vec![
+                    Dataset::default()
+                        .name("Frequency Spectrum")
+                        .marker(tui::symbols::Marker::Dot)
+                        .style(Style::default().fg(Color::Cyan))
+                        .data(&data), // Use the stored data
+                ])
+                .block(Block::default().title("Frequency Spectrum").borders(Borders::ALL))
+                .x_axis(Axis::default().title("Frequency").bounds([0.0, 2400.0]))
+                .y_axis(Axis::default().title("Magnitude").bounds([0.0, y_axis_upper_bound.into()]));
+
+                f.render_widget(chart, chunks[0]);
+
+                let text = Paragraph::new(format!("Max dB: {:.2}\nFPS: {}", max_db, fps))
+                    .block(Block::default().title("Info").borders(Borders::ALL));
+                f.render_widget(text, chunks[1]);
+            }).unwrap();
+        }
+
+        // Sleep for the frame delay
+        thread::sleep(frame_delay);
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let terminal = setup_terminal()?;
+    let host = cpal::default_host();
+    let device = host.default_input_device().expect("Failed to get input device");
+    let config = device.default_input_config().expect("Failed to get default config");
 
     // Shared state for the maximum decibel value
     let max_db_value = Arc::new(Mutex::new(f32::NEG_INFINITY));
@@ -116,93 +240,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)));
     let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)));
 
-    // Spawn a thread for encoding
+    // Spawn threads
     thread::spawn({
         let opus_encoder = Arc::clone(&opus_encoder);
-        move || {
-            while let Ok(pcm_data) = pcm_rx.recv() {
-                let mut opus_buffer = vec![0; 4000];
-                let encoded_bytes = opus_encoder.lock().unwrap().encode(&pcm_data, &mut opus_buffer);
-                if encoded_bytes > 0 {
-                    encoded_tx.send(opus_buffer[..encoded_bytes as usize].to_vec()).unwrap();
-                }
-            }
-        }
+        move || encoding_thread(opus_encoder, pcm_rx, encoded_tx)
     });
-
-    // Spawn a thread for decoding
     thread::spawn({
         let opus_decoder = Arc::clone(&opus_decoder);
-        move || {
-            while let Ok(encoded_data) = encoded_rx.recv() {
-                let mut pcm_out = vec![0; FRAME_SIZE as usize];
-                opus_decoder.lock().unwrap().decode(&encoded_data, &mut pcm_out);
-                // Process or play back pcm_out
-            }
-        }
+        move || decoding_thread(opus_decoder, encoded_rx)
     });
 
     // Flag to indicate when to exit
     let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    let r = Arc::clone(&running);
 
     // Setup Ctrl+C handler
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    // Clone `running` for use in the thread
-    let running_clone = running.clone();
-
-    let stream = device
-        .build_input_stream(
-            &config.clone().into(),
-            {
-                let max_db_value = Arc::clone(&max_db_value);
-                let pcm_tx = pcm_tx.clone();
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    // Convert f32 samples to i16 for Opus encoding
-                    let pcm_data: Vec<i16> = data.iter().map(|&x| (x * 32767.0) as i16).collect();
-                    pcm_tx.send(pcm_data).unwrap();
-
-                    // Increase the FFT size by zero-padding the input data
-                    let fft_size = 8192;
-                    let mut buffer: Vec<Complex<f32>> =
-                        data.iter().map(|&x| Complex::new(x, 0.0)).collect();
-                    buffer.resize(fft_size, Complex::new(0.0, 0.0)); // Zero-padding
-
-                    // Create an FFT planner and perform the FFT
-                    let mut planner = FftPlanner::new();
-                    let fft = planner.plan_fft_forward(buffer.len());
-                    fft.process(&mut buffer);
-
-                    // Calculate magnitudes and frequencies
-                    let magnitudes: Vec<f32> = buffer.iter().map(|c| c.norm()).collect();
-                    let sample_rate = config.sample_rate().0 as f32;
-                    let frequencies: Vec<f32> = (0..buffer.len())
-                        .map(|i| i as f32 * sample_rate / buffer.len() as f32)
-                        .collect();
-
-                    // Update maximum decibel value to track highest signal
-                    {
-                        let mut max_db_lock = max_db_value.lock().unwrap();
-                        let max_magnitude =
-                            magnitudes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let max_db = 20.0 * max_magnitude.log10();
-                        if max_db > *max_db_lock {
-                            *max_db_lock = max_db;
-                        }
-                    }
-
-                    // Send data to the plotting thread
-                    tx.send((frequencies, magnitudes))
-                        .expect("Failed to send data to plotting thread");
-                }
-            },
-            err_fn,
-            None,
-        )
-        .expect("Failed to build input stream");
+    let stream = setup_audio_stream(pcm_tx, Arc::clone(&max_db_value), tx, config.clone().into(), device)?;
 
     stream.play().expect("Failed to play stream");
 
@@ -212,67 +269,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Plotting and ASCII GIF display loop
     let terminal = Arc::new(Mutex::new(terminal)); // Wrap terminal in Arc<Mutex<>>
-    let terminal_clone = Arc::clone(&terminal);
-
-    thread::spawn(move || {
-        loop {
-            if !running_clone.load(Ordering::SeqCst) {
-                break;
-            }
-            // Try to receive data from the audio processing thread without blocking
-            if let Ok((frequencies, magnitudes)) = rx.recv() {
-                let data: Vec<(f64, f64)> = frequencies
-                    .iter()
-                    .zip(magnitudes.iter())
-                    .map(|(&f, &m)| (f as f64, m as f64))
-                    .collect(); // Store in a variable
-                let mut terminal = terminal_clone.lock().unwrap(); // Lock the terminal for drawing
-                terminal
-                    .draw(|f| {
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .margin(1)
-                            .constraints(
-                                [Constraint::Percentage(70), Constraint::Percentage(30)].as_ref(),
-                            )
-                            .split(f.size());
-
-                        // Get the current max decibel value
-                        let max_db = *max_db_value.lock().unwrap();
-                        // Calculate the y-axis upper bound based on max_db
-                        let y_axis_upper_bound = (max_db / 20.0).exp(); // Convert dB to linear scale
-
-                        let chart = Chart::new(vec![
-                            Dataset::default()
-                                .name("Frequency Spectrum")
-                                .marker(tui::symbols::Marker::Dot)
-                                .style(Style::default().fg(Color::Cyan))
-                                .data(&data), // Use the stored data
-                        ])
-                        .block(
-                            Block::default()
-                                .title("Frequency Spectrum")
-                                .borders(Borders::ALL),
-                        )
-                        .x_axis(Axis::default().title("Frequency").bounds([0.0, 2400.0]))
-                        .y_axis(
-                            Axis::default()
-                                .title("Magnitude")
-                                .bounds([0.0, y_axis_upper_bound.into()]),
-                        );
-
-                        f.render_widget(chart, chunks[0]);
-
-                        let text = Paragraph::new(format!("Max dB: {:.2}\nFPS: {}", max_db, fps))
-                            .block(Block::default().title("Info").borders(Borders::ALL));
-                        f.render_widget(text, chunks[1]);
-                    })
-                    .unwrap();
-            }
-
-            // Sleep for the frame delay
-            thread::sleep(frame_delay);
-        }
+    thread::spawn({
+        let terminal = Arc::clone(&terminal);
+        let max_db_value = Arc::clone(&max_db_value);
+        let running = Arc::clone(&running);
+        move || plotting_thread(rx, terminal, max_db_value, running, frame_delay, fps)
     });
 
     // Run indefinitely

@@ -26,7 +26,7 @@ use error::AudioError;
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 // Define a struct to encapsulate the Opus encoder
-struct SafeOpusEncoder {
+struct  SafeOpusEncoder {
     encoder: *mut OpusEncoder,
 }
 
@@ -134,7 +134,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
 fn setup_audio_stream(
     pcm_tx: kanal::Sender<Vec<i16>>,
     max_db_value: Arc<Mutex<f32>>,
-    tx: kanal::Sender<(Vec<f32>, Vec<f32>)>,
+    plot_tx: kanal::Sender<(Vec<f32>, Vec<f32>)>,
     config: cpal::StreamConfig,
     device: cpal::Device,
 ) -> Result<cpal::Stream> {
@@ -170,7 +170,7 @@ fn setup_audio_stream(
             }
 
             // Send data to the plotting thread
-            tx.send((frequencies, magnitudes))
+            plot_tx.send((frequencies, magnitudes))
                 .expect("Failed to send FFT data");
         },
         |err| eprintln!("Stream error: {}", err),
@@ -269,10 +269,10 @@ fn plotting_thread(
 fn main() -> Result<()> {
     let terminal = setup_terminal()?;
     let host = cpal::default_host();
-    let device = host
+    let input_device = host
         .default_input_device()
         .context("Failed to get input device")?;
-    let config = device
+    let input_config = input_device
         .default_input_config()
         .context("Failed to get default config")?;
 
@@ -280,7 +280,7 @@ fn main() -> Result<()> {
     let max_db_value = Arc::new(Mutex::new(f32::NEG_INFINITY));
 
     // Kanal channel for sending data to the plotting thread
-    let (tx, rx) = bounded(10);
+    let (plot_tx, plot_rx) = bounded(10);
 
     // Create a channel for passing PCM data to the encoding thread
     let (pcm_tx, pcm_rx) = kanal::bounded::<Vec<i16>>(10);
@@ -289,7 +289,7 @@ fn main() -> Result<()> {
     let (encoded_tx, encoded_rx) = kanal::bounded(10);
 
     // Initialize Opus encoder and decoder with proper error handling
-    let sample_rate = config.sample_rate().0 as i32;
+    let sample_rate = input_config.sample_rate().0 as i32;
     let channels = 1; // Assuming mono audio
     let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)?));
     let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)?));
@@ -314,7 +314,7 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let stream = setup_audio_stream(pcm_tx, Arc::clone(&max_db_value), tx, config.clone().into(), device)?;
+    let stream = setup_audio_stream(pcm_tx, Arc::clone(&max_db_value), plot_tx, input_config.clone().into(), input_device)?;
 
     stream.play().expect("Failed to play stream");
 
@@ -328,7 +328,7 @@ fn main() -> Result<()> {
         let terminal = Arc::clone(&terminal);
         let max_db_value = Arc::clone(&max_db_value);
         let running = Arc::clone(&running);
-        move || plotting_thread(rx, terminal, max_db_value, running, frame_delay, fps)
+        move || plotting_thread(plot_rx, terminal, max_db_value, running, frame_delay, fps)
     });
 
     // Run indefinitely
@@ -343,6 +343,10 @@ fn main() -> Result<()> {
                 }
             }
         }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
     }
 
     // Restore terminal

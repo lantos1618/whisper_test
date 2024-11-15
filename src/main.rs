@@ -1,11 +1,15 @@
+use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ctrlc;
+use kanal::{bounded, Receiver, Sender};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -14,10 +18,6 @@ use tui::layout::{Constraint, Direction, Layout};
 use tui::style::{Color, Style};
 use tui::widgets::{Axis, Block, Borders, Chart, Dataset, Paragraph};
 use tui::Terminal;
-use kanal::bounded;
-use std::sync::atomic::{AtomicBool, Ordering};
-use ctrlc;
-use anyhow::{Context, Result};
 mod error;
 use error::AudioError;
 
@@ -26,7 +26,8 @@ use error::AudioError;
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 // Define a struct to encapsulate the Opus encoder
-struct  SafeOpusEncoder {
+const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
+struct SafeOpusEncoder {
     encoder: *mut OpusEncoder,
 }
 
@@ -35,14 +36,20 @@ unsafe impl Send for SafeOpusEncoder {}
 impl SafeOpusEncoder {
     fn new(sample_rate: i32, channels: i32) -> Result<Self> {
         let mut error = 0;
-        let encoder = unsafe { 
-            opus_encoder_create(sample_rate, channels, OPUS_APPLICATION_AUDIO as i32, &mut error) 
+        let encoder = unsafe {
+            opus_encoder_create(
+                sample_rate,
+                channels,
+                OPUS_APPLICATION_AUDIO as i32,
+                &mut error,
+            )
         };
-        
+
         if error != 0 {
-            return Err(AudioError::OpusEncodeError(error)).context("Failed to create Opus encoder");
+            return Err(AudioError::OpusEncodeError(error))
+                .context("Failed to create Opus encoder");
         }
-        
+
         Ok(SafeOpusEncoder { encoder })
     }
 
@@ -53,7 +60,7 @@ impl SafeOpusEncoder {
                 pcm_data.as_ptr(),
                 FRAME_SIZE,
                 opus_buffer.as_mut_ptr(),
-                opus_buffer.len() as i32
+                opus_buffer.len() as i32,
             )
         };
 
@@ -82,14 +89,13 @@ unsafe impl Send for SafeOpusDecoder {}
 impl SafeOpusDecoder {
     fn new(sample_rate: i32, channels: i32) -> Result<Self> {
         let mut error = 0;
-        let decoder = unsafe { 
-            opus_decoder_create(sample_rate, channels, &mut error) 
-        };
-        
+        let decoder = unsafe { opus_decoder_create(sample_rate, channels, &mut error) };
+
         if error != 0 {
-            return Err(AudioError::OpusDecodeError(error)).context("Failed to create Opus decoder");
+            return Err(AudioError::OpusDecodeError(error))
+                .context("Failed to create Opus decoder");
         }
-        
+
         Ok(SafeOpusDecoder { decoder })
     }
 
@@ -101,7 +107,7 @@ impl SafeOpusDecoder {
                 opus_buffer.len() as i32,
                 pcm_out.as_mut_ptr(),
                 FRAME_SIZE,
-                0
+                0,
             )
         };
 
@@ -120,251 +126,86 @@ impl Drop for SafeOpusDecoder {
     }
 }
 
-const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
+fn audio_input(tx: Sender<f32>) -> Result<()> {
+    let host = cpal::default_host();
+    let device = host.default_input_device().context("No input device available")?;
+    let config = device.default_input_config().context("No input config available")?;
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
-    enable_raw_mode().context("Failed to enable raw mode")?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("Failed to execute terminal commands")?;
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("Failed to create terminal")
+    let channels = config.channels() as usize;
+
+    let input_callback = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        for &sample in data.iter() {
+            if tx.try_send(sample).is_err() {
+                eprintln!("Warning: output stream fell behind; sample dropped.");
+            }
+        }
+    };
+
+    let stream = device.build_input_stream(
+        &config.into(),
+        input_callback,
+        |err| {
+            eprintln!("Audio stream error: {}", err);
+        },
+        None,
+    )?;
+
+    stream.play()?;
+
+    // Keep the stream alive
+    loop {
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
-fn setup_audio_stream(
-    pcm_tx: kanal::Sender<Vec<i16>>,
-    max_db_value: Arc<Mutex<f32>>,
-    plot_tx: kanal::Sender<(Vec<f32>, Vec<f32>)>,
-    config: cpal::StreamConfig,
-    device: cpal::Device,
-) -> Result<cpal::Stream> {
-    let stream = device.build_input_stream(
-        &config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let pcm_data: Vec<i16> = data.iter().map(|&x| (x * 32767.0) as i16).collect();
-            pcm_tx.send(pcm_data).expect("Failed to send PCM data");
+fn audio_output(rx: Receiver<f32>) -> Result<()> {
+    let host = cpal::default_host();
+    let device = host.default_output_device().context("No output device available")?;
+    let config = device.default_output_config().context("No output config available")?;
 
-            // Increase the FFT size by zero-padding the input data
-            let fft_size = 8192;
-            let mut buffer: Vec<Complex<f32>> = data.iter().map(|&x| Complex::new(x, 0.0)).collect();
-            buffer.resize(fft_size, Complex::new(0.0, 0.0)); // Zero-padding
+    let channels = config.channels() as usize;
 
-            // Create an FFT planner and perform the FFT
-            let mut planner = FftPlanner::new();
-            let fft = planner.plan_fft_forward(buffer.len());
-            fft.process(&mut buffer);
-
-            // Calculate magnitudes and frequencies
-            let magnitudes: Vec<f32> = buffer.iter().map(|c| c.norm()).collect();
-            let sample_rate = config.sample_rate.0 as f32;
-            let frequencies: Vec<f32> = (0..buffer.len()).map(|i| i as f32 * sample_rate / buffer.len() as f32).collect();
-
-            // Update maximum decibel value to track highest signal
-            {
-                let mut max_db_lock = max_db_value.lock().unwrap();
-                let max_magnitude = magnitudes.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let max_db = 20.0 * max_magnitude.log10();
-                if max_db > *max_db_lock {
-                    *max_db_lock = max_db;
+    let output_callback = move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        for frame in output.chunks_mut(channels) {
+            let sample = rx.try_recv().unwrap();
+            for sample_channel in frame.iter_mut() {
+                match sample {
+                    Some(sample) => *sample_channel = sample,
+                    None => *sample_channel = 0.0,
                 }
             }
+        }
+    };
 
-            // Send data to the plotting thread
-            plot_tx.send((frequencies, magnitudes))
-                .expect("Failed to send FFT data");
+    let stream = device.build_output_stream(
+        &config.into(),
+        output_callback,
+        |err| {
+            eprintln!("Audio stream error: {}", err);
         },
-        |err| eprintln!("Stream error: {}", err),
         None,
-    ).context("Failed to build input stream")?;
+    )?;
 
-    Ok(stream)
-}
+    stream.play()?;
 
-fn encoding_thread(
-    opus_encoder: Arc<Mutex<SafeOpusEncoder>>,
-    pcm_rx: kanal::Receiver<Vec<i16>>,
-    encoded_tx: kanal::Sender<Vec<u8>>,
-) -> Result<()> {
-    while let Ok(pcm_data) = pcm_rx.recv() {
-        let mut opus_buffer = vec![0; 4000];
-        let encoded_bytes = opus_encoder
-            .lock()
-            .unwrap()
-            .encode(&pcm_data, &mut opus_buffer)
-            .context("Failed to encode audio")?;
-            
-        if encoded_bytes > 0 {
-            encoded_tx
-                .send(opus_buffer[..encoded_bytes as usize].to_vec())
-                .context("Failed to send encoded data")?;
-        }
-    }
-    Ok(())
-}
-
-fn decoding_thread(
-    opus_decoder: Arc<Mutex<SafeOpusDecoder>>,
-    encoded_rx: kanal::Receiver<Vec<u8>>,
-) -> Result<()> {
-    while let Ok(encoded_data) = encoded_rx.recv() {
-        let mut pcm_out = vec![0; FRAME_SIZE as usize];
-        opus_decoder.lock().unwrap().decode(&encoded_data, &mut pcm_out);
-        // Process or play back pcm_out
-    }
-    Ok(())
-}
-
-fn plotting_thread(
-    rx: kanal::Receiver<(Vec<f32>, Vec<f32>)>,
-    terminal: Arc<Mutex<Terminal<CrosstermBackend<std::io::Stdout>>>>,
-    max_db_value: Arc<Mutex<f32>>,
-    running: Arc<AtomicBool>,
-    frame_delay: Duration,
-    fps: u128,
-) {
+    // Keep the stream alive
     loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        // Try to receive data from the audio processing thread without blocking
-        if let Ok((frequencies, magnitudes)) = rx.recv() {
-            let data: Vec<(f64, f64)> = frequencies.iter().zip(magnitudes.iter()).map(|(&f, &m)| (f as f64, m as f64)).collect(); // Store in a variable
-            let mut terminal = terminal.lock().unwrap(); // Lock the terminal for drawing
-            terminal.draw(|f| {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .margin(1)
-                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
-                    .split(f.size());
-
-                // Get the current max decibel value
-                let max_db = *max_db_value.lock().unwrap();
-                // Calculate the y-axis upper bound based on max_db
-                let y_axis_upper_bound = (max_db / 20.0).exp(); // Convert dB to linear scale
-
-                let chart = Chart::new(vec![
-                    Dataset::default()
-                        .name("Frequency Spectrum")
-                        .marker(tui::symbols::Marker::Dot)
-                        .style(Style::default().fg(Color::Cyan))
-                        .data(&data), // Use the stored data
-                ])
-                .block(Block::default().title("Frequency Spectrum").borders(Borders::ALL))
-                .x_axis(Axis::default().title("Frequency").bounds([0.0, 2400.0]))
-                .y_axis(Axis::default().title("Magnitude").bounds([0.0, y_axis_upper_bound.into()]));
-
-                f.render_widget(chart, chunks[0]);
-
-                let text = Paragraph::new(format!("Max dB: {:.2}\nFPS: {}", max_db, fps))
-                    .block(Block::default().title("Info").borders(Borders::ALL));
-                f.render_widget(text, chunks[1]);
-            }).unwrap();
-        }
-
-        // Sleep for the frame delay
-        thread::sleep(frame_delay);
+        thread::sleep(Duration::from_millis(10));
     }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    let terminal = setup_terminal()?;
-    let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .context("Failed to get input device")?;
-    let input_config = input_device
-        .default_input_config()
-        .context("Failed to get default config")?;
-
-    // Shared state for the maximum decibel value
-    let max_db_value = Arc::new(Mutex::new(f32::NEG_INFINITY));
-
-    // Kanal channel for sending data to the plotting thread
-    let (plot_tx, plot_rx) = bounded(10);
-
-    // Create a channel for passing PCM data to the encoding thread
-    let (pcm_tx, pcm_rx) = kanal::bounded::<Vec<i16>>(10);
-
-    // Create a channel for passing encoded data to the decoding thread
-    let (encoded_tx, encoded_rx) = kanal::bounded(10);
-
-    // Initialize Opus encoder and decoder with proper error handling
-    let sample_rate = input_config.sample_rate().0 as i32;
-    let channels = 1; // Assuming mono audio
-    let opus_encoder = Arc::new(Mutex::new(SafeOpusEncoder::new(sample_rate, channels)?));
-    let opus_decoder = Arc::new(Mutex::new(SafeOpusDecoder::new(sample_rate, channels)?));
+    let (input_tx, input_rx) = bounded(1024); // Adjust buffer size as necessary
 
     let handles = vec![
-        thread::spawn({
-            let opus_encoder = Arc::clone(&opus_encoder);
-        move || encoding_thread(opus_encoder, pcm_rx, encoded_tx)
-        }),
-        thread::spawn({
-            let opus_decoder = Arc::clone(&opus_decoder);
-            move || decoding_thread(opus_decoder, encoded_rx)
-        }),
+        thread::spawn(move || audio_input(input_tx)),
+        thread::spawn(move || audio_output(input_rx)),
     ];
 
-    // Flag to indicate when to exit
-    let running = Arc::new(AtomicBool::new(true));
-    let r = Arc::clone(&running);
-
-    // Setup Ctrl+C handler
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })?;
-
-    let stream = setup_audio_stream(pcm_tx, Arc::clone(&max_db_value), plot_tx, input_config.clone().into(), input_device)?;
-
-    stream.play().expect("Failed to play stream");
-
-    // 60 fps = 16.6' ms, 100 fps = 10 ms, 120 fps = 8.3 ms
-    let frame_delay = Duration::from_millis(8);
-    let fps = 1000 / frame_delay.as_millis(); // Calculate FPS
-
-    // Plotting and ASCII GIF display loop
-    let terminal = Arc::new(Mutex::new(terminal)); // Wrap terminal in Arc<Mutex<>>
-    thread::spawn({
-        let terminal = Arc::clone(&terminal);
-        let max_db_value = Arc::clone(&max_db_value);
-        let running = Arc::clone(&running);
-        move || plotting_thread(plot_rx, terminal, max_db_value, running, frame_delay, fps)
-    });
-
-    // Run indefinitely
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        if event::poll(frame_delay)? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
-                }
-            }
-        }
-    }
-
     for handle in handles {
-        let _ = handle.join();
-    }
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.lock().unwrap().backend_mut(), // Lock the terminal for restoration
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.lock().unwrap().show_cursor()?; // Lock the terminal for cursor display
-
-    // Clean up Opus encoder and decoder
-    unsafe {
-        let encoder = opus_encoder.lock().unwrap();
-        opus_encoder_destroy(encoder.encoder);
-
-        let decoder = opus_decoder.lock().unwrap();
-        opus_decoder_destroy(decoder.decoder);
+        handle.join().unwrap();
     }
 
     Ok(())

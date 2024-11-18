@@ -28,7 +28,6 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 // Define a struct to encapsulate the Opus encoder
 
-const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
 const MAX_PACKET_SIZE: usize = 1275; // Maximum size of an Opus packet for 48kHz stereo
 struct SafeOpusEncoder {
     encoder: *mut OpusEncoder,
@@ -43,7 +42,7 @@ impl SafeOpusEncoder {
             opus_encoder_create(
                 sample_rate,
                 channels,
-                OPUS_APPLICATION_AUDIO as i32,
+                OPUS_APPLICATION_VOIP as i32,
                 &mut error,
             )
         };
@@ -56,12 +55,12 @@ impl SafeOpusEncoder {
         Ok(SafeOpusEncoder { encoder })
     }
 
-    fn encode(&self, pcm_data: &[i16], opus_buffer: &mut [u8]) -> Result<i32> {
+    fn encode(&self, pcm_data: &[i16], opus_buffer: &mut [u8], frame_size: i32) -> Result<i32> {
         let result = unsafe {
             opus_encode(
                 self.encoder,
                 pcm_data.as_ptr(),
-                FRAME_SIZE,
+                frame_size,
                 opus_buffer.as_mut_ptr(),
                 opus_buffer.len() as i32,
             )
@@ -72,12 +71,12 @@ impl SafeOpusEncoder {
         }
         Ok(result)
     }
-    fn encode_float(&self, pcm_data: &[f32], opus_buffer: &mut [u8]) -> Result<i32> {
+    fn encode_float(&self, pcm_data: &[f32], opus_buffer: &mut [u8], frame_size: i32) -> Result<i32> {
         let result = unsafe {
             opus_encode_float(
                 self.encoder,
                 pcm_data.as_ptr(),
-                FRAME_SIZE,
+                frame_size,
                 opus_buffer.as_mut_ptr(),
                 opus_buffer.len() as i32,
             )
@@ -118,14 +117,14 @@ impl SafeOpusDecoder {
         Ok(SafeOpusDecoder { decoder })
     }
 
-    fn decode(&self, opus_buffer: &[u8], pcm_out: &mut [i16]) -> Result<i32> {
+    fn decode(&self, opus_buffer: &[u8], pcm_out: &mut [i16], frame_size: i32) -> Result<i32> {
         let result = unsafe {
             opus_decode(
                 self.decoder,
                 opus_buffer.as_ptr(),
                 opus_buffer.len() as i32,
                 pcm_out.as_mut_ptr(),
-                FRAME_SIZE,
+                frame_size,
                 0,
             )
         };
@@ -136,14 +135,14 @@ impl SafeOpusDecoder {
         Ok(result)
     }
 
-    fn decode_float(&self, opus_buffer: &[u8], pcm_out: &mut [f32]) -> Result<i32> {
+    fn decode_float(&self, opus_buffer: &[u8], pcm_out: &mut [f32], frame_size: i32) -> Result<i32> {
         let result = unsafe {
             opus_decode_float(
                 self.decoder,
                 opus_buffer.as_ptr(),
                 opus_buffer.len() as i32,
                 pcm_out.as_mut_ptr(),
-                FRAME_SIZE,
+                frame_size,
                 0,
             )
         };
@@ -163,7 +162,7 @@ impl Drop for SafeOpusDecoder {
     }
 }
 
-fn setup_host() -> Result<(cpal::Device, cpal::Device, cpal::StreamConfig)> {
+fn setup_host() -> Result<(cpal::Device, cpal::Device, cpal::StreamConfig, i32)> {
     let host = cpal::default_host();
 
     let input_device = host
@@ -177,8 +176,11 @@ fn setup_host() -> Result<(cpal::Device, cpal::Device, cpal::StreamConfig)> {
     let config = input_device
         .default_input_config()
         .map_err(|e| AudioError::StreamConfigError(e.to_string()))?;
+    
+    // Calculate frame size based on sample rate (20ms frame size)
+    let frame_size = (config.sample_rate().0 as f32 * 0.02) as i32;
 
-    Ok((input_device, output_device, config.into()))
+    Ok((input_device, output_device, config.into(), frame_size))
 }
 
 fn err_fn(err: cpal::StreamError) {
@@ -186,7 +188,7 @@ fn err_fn(err: cpal::StreamError) {
 }
 
 fn audio_input(running: Arc<AtomicBool>, tx: Sender<Vec<f32>>) -> Result<()> {
-    let (input_device, _output_device, config) = setup_host()?;
+    let (input_device, _output_device, config, _frame_size) = setup_host()?;
 
     let input_data_fn =
         move |data: &[f32], _: &cpal::InputCallbackInfo| match tx.try_send(data.to_vec()) {
@@ -205,7 +207,7 @@ fn audio_input(running: Arc<AtomicBool>, tx: Sender<Vec<f32>>) -> Result<()> {
 }
 
 fn audio_output(running: Arc<AtomicBool>, rx: Receiver<Vec<f32>>) -> Result<()> {
-    let (_input_device, output_device, config) = setup_host()?;
+    let (_input_device, output_device, config, _frame_size) = setup_host()?;
 
     let output_data_fn = move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
         match rx.try_recv() {
@@ -234,6 +236,7 @@ fn encode_audio(
     running: Arc<AtomicBool>,
     rx: Receiver<Vec<f32>>,
     tx: Sender<Vec<u8>>,
+    frame_size: i32,
 ) -> Result<()> {
     let encoder = SafeOpusEncoder::new(48000, 1)?;
     let mut opus_buffer = vec![0u8; MAX_PACKET_SIZE];
@@ -243,9 +246,8 @@ fn encode_audio(
             Ok(val) => {
                 match val {
                     Some(data) => {
-                        let encoded_len = encoder.encode_float(&data, &mut opus_buffer)?;
+                        let encoded_len = encoder.encode_float(&data, &mut opus_buffer, frame_size)?;
                         tx.send(opus_buffer[..encoded_len as usize].to_vec())?;
-
                     }
                     None => (),
                 }
@@ -260,6 +262,7 @@ fn decode_audio(
     running: Arc<AtomicBool>,
     rx: Receiver<Vec<u8>>,
     tx: Sender<Vec<f32>>,
+    frame_size: i32,
 ) -> Result<()> {
     let decoder = SafeOpusDecoder::new(48000, 1)?;
 
@@ -267,8 +270,8 @@ fn decode_audio(
         match rx.try_recv() {
             Ok(val) => match val {
                 Some(data) => {
-                    let mut pcm_out = vec![0.0; FRAME_SIZE as usize];
-                    let decoded_len = decoder.decode_float(&data, &mut pcm_out)?;
+                    let mut pcm_out = vec![0.0; frame_size as usize];
+                    let decoded_len = decoder.decode_float(&data, &mut pcm_out, frame_size)?;
                     tx.send(pcm_out[..decoded_len as usize].to_vec())?;
                 }
                 None => (),
@@ -280,12 +283,15 @@ fn decode_audio(
 }
 
 fn main() -> Result<()> {
-    let (input_tx, input_rx) = bounded(8192);
-    let (encoder_tx, encoder_rx) = bounded(8192);
-    let (decoder_tx, decoder_rx) = bounded(8192);
+    let (input_tx, input_rx) = bounded(16);
+    let (encoder_tx, encoder_rx) = bounded(16);
+    let (decoder_tx, decoder_rx) = bounded(16);
 
     let running = Arc::new(AtomicBool::new(true));
     let running_ctrlc = running.clone();
+
+    // Get frame_size from host setup
+    let (_input_device, _output_device, _config, frame_size) = setup_host()?;
 
     // Set up Ctrl+C handler
     ctrlc::set_handler(move || {
@@ -300,11 +306,11 @@ fn main() -> Result<()> {
         },
         {
             let running = running.clone();
-            thread::spawn(move || encode_audio(running, input_rx, encoder_tx))
+            thread::spawn(move || encode_audio(running, input_rx, encoder_tx, frame_size))
         },
         {
             let running = running.clone();
-            thread::spawn(move || decode_audio(running, encoder_rx, decoder_tx))
+            thread::spawn(move || decode_audio(running, encoder_rx, decoder_tx, frame_size))
         },
         {
             let running = running.clone();

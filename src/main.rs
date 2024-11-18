@@ -19,6 +19,7 @@ use tui::style::{Color, Style};
 use tui::widgets::{Axis, Block, Borders, Chart, Dataset, Paragraph};
 use tui::Terminal;
 mod error;
+use cpal::Stream;
 use error::AudioError;
 
 // Include the generated bindings
@@ -27,6 +28,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 // Define a struct to encapsulate the Opus encoder
 const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
+
 struct SafeOpusEncoder {
     encoder: *mut OpusEncoder,
 }
@@ -126,86 +128,165 @@ impl Drop for SafeOpusDecoder {
     }
 }
 
-fn audio_input(tx: Sender<f32>) -> Result<()> {
+fn setup_host() -> Result<(cpal::Device, cpal::Device, cpal::StreamConfig)> {
     let host = cpal::default_host();
-    let device = host.default_input_device().context("No input device available")?;
-    let config = device.default_input_config().context("No input config available")?;
 
-    let channels = config.channels() as usize;
+    let input_device = host
+        .default_input_device()
+        .ok_or_else(|| AudioError::NoDevice("No input device found".into()))?;
 
-    let input_callback = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        for &sample in data.iter() {
-            if tx.try_send(sample).is_err() {
-                eprintln!("Warning: output stream fell behind; sample dropped.");
-            }
-        }
-    };
+    let output_device = host
+        .default_output_device()
+        .ok_or_else(|| AudioError::NoDevice("No output device found".into()))?;
 
-    let stream = device.build_input_stream(
-        &config.into(),
-        input_callback,
-        |err| {
-            eprintln!("Audio stream error: {}", err);
-        },
-        None,
-    )?;
+    let config = input_device
+        .default_input_config()
+        .map_err(|e| AudioError::StreamConfigError(e.to_string()))?;
 
-    stream.play()?;
-
-    // Keep the stream alive
-    loop {
-        thread::sleep(Duration::from_millis(10));
-    }
+    Ok((input_device, output_device, config.into()))
 }
 
-fn audio_output(rx: Receiver<f32>) -> Result<()> {
-    let host = cpal::default_host();
-    let device = host.default_output_device().context("No output device available")?;
-    let config = device.default_output_config().context("No output config available")?;
+fn err_fn(err: cpal::StreamError) {
+    eprintln!("an error occurred on stream: {}", err);
+}
 
-    let channels = config.channels() as usize;
+fn audio_input(running: Arc<AtomicBool>, tx: Sender<Vec<f32>>) -> Result<()> {
+    let (input_device, _output_device, config) = setup_host()?;
 
-    let output_callback = move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        for frame in output.chunks_mut(channels) {
-            let sample = rx.try_recv().unwrap();
-            for sample_channel in frame.iter_mut() {
-                match sample {
-                    Some(sample) => *sample_channel = sample,
-                    None => *sample_channel = 0.0,
-                }
-            }
-        }
-    };
+    let input_data_fn =
+        move |data: &[f32], _: &cpal::InputCallbackInfo| match tx.try_send(data.to_vec()) {
+            Ok(_) => (),
+            Err(e) => eprintln!("Error audio_input: {:?}", e),
+        };
 
-    let stream = device.build_output_stream(
-        &config.into(),
-        output_callback,
-        |err| {
-            eprintln!("Audio stream error: {}", err);
-        },
-        None,
-    )?;
-
+    let stream = input_device.build_input_stream(&config, input_data_fn, err_fn, None)?;
     stream.play()?;
 
-    // Keep the stream alive
-    loop {
-        thread::sleep(Duration::from_millis(10));
+    while running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
     }
 
     Ok(())
 }
 
+fn audio_output(running: Arc<AtomicBool>, rx: Receiver<Vec<f32>>) -> Result<()> {
+    let (_input_device, output_device, config) = setup_host()?;
+
+    let output_data_fn = move |output: &mut [f32], _: &cpal::OutputCallbackInfo| match rx.try_recv()
+    {
+        Ok(val) => match val {
+            Some(data) => {
+                for (i, sample) in output.iter_mut().enumerate().take(data.len()) {
+                    *sample = data[i];
+                }
+            }
+            None => (),
+        },
+        Err(e) => eprintln!("Error audio_output: {:?}", e),
+    };
+
+    let stream = output_device.build_output_stream(&config, output_data_fn, err_fn, None)?;
+    stream.play()?;
+
+    while running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(())
+}
+
+fn encode_audio(
+    running: Arc<AtomicBool>,
+    rx: Receiver<Vec<f32>>,
+    tx: Sender<Vec<u8>>,
+) -> Result<()> {
+    let encoder = SafeOpusEncoder::new(48000, 1)?;
+    let mut opus_buffer = vec![0; 4096];
+
+    while running.load(Ordering::Relaxed) {
+        match rx.try_recv() {
+            Ok(val) => {
+                match val {
+                    Some(data) => {
+                        let pcm_data: Vec<i16> = data
+                            .iter()
+                            .map(|&sample| (sample * 32767.0) as i16)
+                            .collect();
+                        let result = encoder.encode(&pcm_data, &mut opus_buffer)?;
+                        println!("encode_audio: {:?}", result);
+                        tx.send(opus_buffer.clone())?;
+
+                        // // dont encode, just pass it on to test. we need to F32 to u8
+                        // let u8_data: Vec<u8> = data.iter().map(|&sample| (sample * 127.0 + 127.0) as u8).collect();
+                        // tx.send(u8_data.clone())?;
+                    }
+                    None => (),
+                }
+            }
+            Err(e) => eprintln!("Error encode_audio: {:?}", e),
+        }
+    }
+    Ok(())
+}
+
+fn decode_audio(
+    running: Arc<AtomicBool>,
+    rx: Receiver<Vec<u8>>,
+    tx: Sender<Vec<f32>>,
+) -> Result<()> {
+    let decoder = SafeOpusDecoder::new(48000, 1)?;
+
+    while running.load(Ordering::Relaxed) {
+        match rx.try_recv() {
+            Ok(val) => match val {
+                Some(data) => {
+                    let mut pcm_data = vec![0; FRAME_SIZE as usize];
+                    let result = decoder.decode(&data, &mut pcm_data)?;
+                    println!("decode_audio: {:?}", result);
+                }
+                None => (),
+            },
+            Err(e) => eprintln!("Error decode_audio: {:?}", e),
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    let (input_tx, input_rx) = bounded(1024); // Adjust buffer size as necessary
+    let (input_tx, input_rx) = bounded(8192);
+    let (encoder_tx, decoder_rx) = bounded(8192);
+    let (decoder_tx, output_rx) = bounded(8192);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let running_ctrlc = running.clone();
+
+    // Set up Ctrl+C handler
+    ctrlc::set_handler(move || {
+        println!("\nReceived Ctrl+C! Shutting down...");
+        running_ctrlc.store(false, Ordering::Relaxed);
+    })?;
 
     let handles = vec![
-        thread::spawn(move || audio_input(input_tx)),
-        thread::spawn(move || audio_output(input_rx)),
+        {
+            let running = running.clone();
+            thread::spawn(move || audio_input(running, input_tx))
+        },
+        {
+            let running = running.clone();
+            thread::spawn(move || encode_audio(running, input_rx, encoder_tx))
+        },
+        {
+            let running = running.clone();
+            thread::spawn(move || decode_audio(running, decoder_rx, decoder_tx))
+        },
+        {
+            let running = running.clone();
+            thread::spawn(move || audio_output(running, output_rx))
+        },
     ];
 
     for handle in handles {
-        handle.join().unwrap();
+        handle.join().unwrap()?;
     }
 
     Ok(())

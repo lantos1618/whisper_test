@@ -27,8 +27,9 @@ use error::AudioError;
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 // Define a struct to encapsulate the Opus encoder
-const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
 
+const FRAME_SIZE: i32 = 960; // Define FRAME_SIZE at the top
+const MAX_PACKET_SIZE: usize = 1275; // Maximum size of an Opus packet for 48kHz stereo
 struct SafeOpusEncoder {
     encoder: *mut OpusEncoder,
 }
@@ -58,6 +59,22 @@ impl SafeOpusEncoder {
     fn encode(&self, pcm_data: &[i16], opus_buffer: &mut [u8]) -> Result<i32> {
         let result = unsafe {
             opus_encode(
+                self.encoder,
+                pcm_data.as_ptr(),
+                FRAME_SIZE,
+                opus_buffer.as_mut_ptr(),
+                opus_buffer.len() as i32,
+            )
+        };
+
+        if result < 0 {
+            return Err(AudioError::OpusEncodeError(result)).context("Failed to encode audio data");
+        }
+        Ok(result)
+    }
+    fn encode_float(&self, pcm_data: &[f32], opus_buffer: &mut [u8]) -> Result<i32> {
+        let result = unsafe {
+            opus_encode_float(
                 self.encoder,
                 pcm_data.as_ptr(),
                 FRAME_SIZE,
@@ -104,6 +121,24 @@ impl SafeOpusDecoder {
     fn decode(&self, opus_buffer: &[u8], pcm_out: &mut [i16]) -> Result<i32> {
         let result = unsafe {
             opus_decode(
+                self.decoder,
+                opus_buffer.as_ptr(),
+                opus_buffer.len() as i32,
+                pcm_out.as_mut_ptr(),
+                FRAME_SIZE,
+                0,
+            )
+        };
+
+        if result < 0 {
+            return Err(AudioError::OpusDecodeError(result)).context("Failed to decode audio data");
+        }
+        Ok(result)
+    }
+
+    fn decode_float(&self, opus_buffer: &[u8], pcm_out: &mut [f32]) -> Result<i32> {
+        let result = unsafe {
+            opus_decode_float(
                 self.decoder,
                 opus_buffer.as_ptr(),
                 opus_buffer.len() as i32,
@@ -172,19 +207,19 @@ fn audio_input(running: Arc<AtomicBool>, tx: Sender<Vec<f32>>) -> Result<()> {
 fn audio_output(running: Arc<AtomicBool>, rx: Receiver<Vec<f32>>) -> Result<()> {
     let (_input_device, output_device, config) = setup_host()?;
 
-    let output_data_fn = move |output: &mut [f32], _: &cpal::OutputCallbackInfo| match rx.try_recv()
-    {
-        Ok(val) => match val {
-            Some(data) => {
-                for (i, sample) in output.iter_mut().enumerate().take(data.len()) {
-                    *sample = data[i];
+    let output_data_fn = move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        match rx.try_recv() {
+            Ok(val) => match val {
+                Some(data) => {
+                    for (i, sample) in output.iter_mut().enumerate().take(data.len()) {
+                        *sample = data[i];
+                    }
                 }
-            }
-            None => (),
-        },
-        Err(e) => eprintln!("Error audio_output: {:?}", e),
+                None => (),
+            },
+            Err(e) => eprintln!("Error audio_output: {:?}", e),
+        };
     };
-
     let stream = output_device.build_output_stream(&config, output_data_fn, err_fn, None)?;
     stream.play()?;
 
@@ -201,24 +236,16 @@ fn encode_audio(
     tx: Sender<Vec<u8>>,
 ) -> Result<()> {
     let encoder = SafeOpusEncoder::new(48000, 1)?;
-    let mut opus_buffer = vec![0; 4096];
+    let mut opus_buffer = vec![0u8; MAX_PACKET_SIZE];
 
     while running.load(Ordering::Relaxed) {
         match rx.try_recv() {
             Ok(val) => {
                 match val {
                     Some(data) => {
-                        let pcm_data: Vec<i16> = data
-                            .iter()
-                            .map(|&sample| (sample * 32767.0) as i16)
-                            .collect();
-                        let result = encoder.encode(&pcm_data, &mut opus_buffer)?;
-                        println!("encode_audio: {:?}", result);
-                        tx.send(opus_buffer.clone())?;
+                        let encoded_len = encoder.encode_float(&data, &mut opus_buffer)?;
+                        tx.send(opus_buffer[..encoded_len as usize].to_vec())?;
 
-                        // // dont encode, just pass it on to test. we need to F32 to u8
-                        // let u8_data: Vec<u8> = data.iter().map(|&sample| (sample * 127.0 + 127.0) as u8).collect();
-                        // tx.send(u8_data.clone())?;
                     }
                     None => (),
                 }
@@ -240,9 +267,9 @@ fn decode_audio(
         match rx.try_recv() {
             Ok(val) => match val {
                 Some(data) => {
-                    let mut pcm_data = vec![0; FRAME_SIZE as usize];
-                    let result = decoder.decode(&data, &mut pcm_data)?;
-                    println!("decode_audio: {:?}", result);
+                    let mut pcm_out = vec![0.0; FRAME_SIZE as usize];
+                    let decoded_len = decoder.decode_float(&data, &mut pcm_out)?;
+                    tx.send(pcm_out[..decoded_len as usize].to_vec())?;
                 }
                 None => (),
             },
@@ -254,8 +281,8 @@ fn decode_audio(
 
 fn main() -> Result<()> {
     let (input_tx, input_rx) = bounded(8192);
-    let (encoder_tx, decoder_rx) = bounded(8192);
-    let (decoder_tx, output_rx) = bounded(8192);
+    let (encoder_tx, encoder_rx) = bounded(8192);
+    let (decoder_tx, decoder_rx) = bounded(8192);
 
     let running = Arc::new(AtomicBool::new(true));
     let running_ctrlc = running.clone();
@@ -277,11 +304,11 @@ fn main() -> Result<()> {
         },
         {
             let running = running.clone();
-            thread::spawn(move || decode_audio(running, decoder_rx, decoder_tx))
+            thread::spawn(move || decode_audio(running, encoder_rx, decoder_tx))
         },
         {
             let running = running.clone();
-            thread::spawn(move || audio_output(running, output_rx))
+            thread::spawn(move || audio_output(running, decoder_rx))
         },
     ];
 
